@@ -292,6 +292,13 @@ def parse_args():
         help="Whether or not to use xformers.",
     )
 
+    # ARGS ADDED IN RAY EXAMPLE
+    parser.add_argument(
+        "--use-deepspeed",
+        action="store_true",
+        help="Whether or not to use DeepSpeed.",
+    )
+
     args = parser.parse_args()
 
     # Sanity checks

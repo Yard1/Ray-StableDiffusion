@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from datasets import load_dataset
@@ -46,6 +46,11 @@ from transformers import CLIPTextModel
 from sd_preprocessing import get_preprocessor
 from sd_utils import parse_args
 
+try:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+except ImportError:
+    DeepSpeedCPUAdam = None
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
 
@@ -57,29 +62,44 @@ FINAL_PIPELINE_DIR = "final_pipeline"
 
 
 def train_fn(config):
+    args = config["args"]
+
     # Env vars necessary for HF to setup DDP
     os.environ["RANK"] = str(session.get_world_rank())
     os.environ["WORLD_SIZE"] = str(session.get_world_size())
     os.environ["LOCAL_RANK"] = str(session.get_local_rank())
+    os.environ["OMP_NUM_THREADS"] = str(
+        session.get_trial_resources().bundles[-1].get("CPU", 1)
+    )
 
-    # FSDP env vars
-    os.environ["ACCELERATE_USE_FSDP"] = "true"
-    os.environ["FSDP_SHARDING_STRATEGY"] = "1"
-    os.environ["FSDP_OFFLOAD_PARAMS"] = "true"
-    os.environ["FSDP_MIN_NUM_PARAMS"] = "100000000"
-    os.environ["FSDP_AUTO_WRAP_POLICY"] = "SIZE_BASED_WRAP"
-    os.environ["FSDP_BACKWARD_PREFETCH"] = "BACKWARD_PRE"
-    os.environ["FSDP_STATE_DICT_TYPE"] = "FULL_STATE_DICT"
+    # DeepSpeed env vars
+    os.environ["ACCELERATE_USE_DEEPSPEED"] = "true" if args.use_deepspeed else "false"
+    os.environ["ACCELERATE_DEEPSPEED_ZERO_STAGE"] = "2"
+    os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(
+        args.gradient_accumulation_steps
+    )
+    os.environ["ACCELERATE_GRADIENT_CLIPPING"] = "1.0"
+    os.environ["ACCELERATE_DEEPSPEED_OFFLOAD_OPTIMIZER_DEVICE"] = "cpu"
+    os.environ["ACCELERATE_DEEPSPEED_OFFLOAD_PARAM_DEVICE"] = "cpu"
 
-    args = config["args"]
+    use_deepspeed = os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true"
+
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+    kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True
+    )  # not sure if this is needed
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         logging_dir=logging_dir,
+        kwargs_handlers=[kwargs],
     )
+    if use_deepspeed:
+        accelerator.state.deepspeed_plugin.deepspeed_config[
+            "train_micro_batch_size_per_gpu"
+        ] = args.train_batch_size
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -170,11 +190,10 @@ def train_fn(config):
             )
 
         optimizer_cls = bnb.optim.AdamW8bit
+    elif use_deepspeed and DeepSpeedCPUAdam:
+        optimizer_cls = DeepSpeedCPUAdam
     else:
         optimizer_cls = torch.optim.AdamW
-
-    # Prepare the model ahead of time (for FSDP)
-    unet = accelerator.prepare(unet)
 
     optimizer = optimizer_cls(
         unet.parameters(),
@@ -203,8 +222,8 @@ def train_fn(config):
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    # Prepare everything aside from the model with our `accelerator`.
-    optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
+    # Prepare everything with our `accelerator`.
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
     if args.use_ema:
         accelerator.register_for_checkpointing(ema_unet)
 
@@ -276,6 +295,7 @@ def train_fn(config):
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
+        last_train_loss = None
         for step, batch in enumerate(
             train_dataset.iter_torch_batches(
                 batch_size=args.train_batch_size,
@@ -348,6 +368,7 @@ def train_fn(config):
                     ema_unet.step(unet.parameters())
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                last_train_loss = train_loss
                 train_loss = 0.0
 
                 checkpoint = None
@@ -371,6 +392,7 @@ def train_fn(config):
                     "step": step,
                     "global_step": global_step,
                     "epoch": epoch,
+                    "last_train_loss": last_train_loss
                 }
 
             if global_step >= args.max_train_steps:
@@ -441,7 +463,9 @@ if __name__ == "__main__":
     trainer = TorchTrainer(
         train_fn,
         train_loop_config={"args": args},
-        scaling_config=ScalingConfig(use_gpu=True, num_workers=8),
+        scaling_config=ScalingConfig(
+            use_gpu=True, num_workers=8, resources_per_worker={"GPU": 1, "CPU": 4}
+        ),
         datasets=ray_datasets,
         preprocessor=preprocessor,
     )

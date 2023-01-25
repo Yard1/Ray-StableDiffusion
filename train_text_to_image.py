@@ -384,7 +384,6 @@ def train_fn(config):
                         checkpoint = Checkpoint.from_dict({"dummy": True})
 
                 logs = {
-                    "step_loss": loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "step": step,
                     "global_step": global_step,

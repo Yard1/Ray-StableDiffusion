@@ -63,12 +63,11 @@ def train_fn(config):
     os.environ["LOCAL_RANK"] = str(session.get_local_rank())
 
     # FSDP env vars
-    os.environ["USE_FSDP"] = "true"
-    os.environ["FSDP_SHARDING_STRATEGY"] = "FULL_SHARD"
+    os.environ["ACCELERATE_USE_FSDP"] = "true"
+    os.environ["FSDP_SHARDING_STRATEGY"] = "1"
     os.environ["FSDP_OFFLOAD_PARAMS"] = "true"
-    os.environ["FSDP_MIN_NUM_PARAMS"] = str(1e8)
+    os.environ["FSDP_MIN_NUM_PARAMS"] = "100000000"
     os.environ["FSDP_AUTO_WRAP_POLICY"] = "SIZE_BASED_WRAP"
-    # os.environ["FSDP_TRANSFORMER_CLS_TO_WRAP"] = str(args.fsdp_transformer_layer_cls_to_wrap)
     os.environ["FSDP_BACKWARD_PREFETCH"] = "BACKWARD_PRE"
     os.environ["FSDP_STATE_DICT_TYPE"] = "FULL_STATE_DICT"
 

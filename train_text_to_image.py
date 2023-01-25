@@ -295,7 +295,6 @@ def train_fn(config):
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        last_train_loss = None
         for step, batch in enumerate(
             train_dataset.iter_torch_batches(
                 batch_size=args.train_batch_size,
@@ -368,8 +367,6 @@ def train_fn(config):
                     ema_unet.step(unet.parameters())
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                last_train_loss = train_loss
-                train_loss = 0.0
 
                 checkpoint = None
                 if global_step % args.checkpointing_steps == 0:
@@ -392,8 +389,9 @@ def train_fn(config):
                     "step": step,
                     "global_step": global_step,
                     "epoch": epoch,
-                    "last_train_loss": last_train_loss
+                    "train_loss": train_loss
                 }
+                train_loss = 0.0
 
             if global_step >= args.max_train_steps:
                 break

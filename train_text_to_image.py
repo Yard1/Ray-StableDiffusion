@@ -179,9 +179,7 @@ def train_fn(config):
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    if args.use_ema:
-        ema_unet.to(accelerator.device)
-    else:
+    if args.use_lora:
         unet.to(accelerator.device, dtype=weight_dtype)
 
     if args.enable_xformers_memory_efficient_attention:
@@ -225,9 +223,6 @@ def train_fn(config):
             )
         unet.set_attn_processor(lora_attn_procs)
         lora_layers = AttnProcsLayers(unet.attn_processors)
-        model = lora_layers
-    else:
-        model = unet
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -261,7 +256,7 @@ def train_fn(config):
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        model.parameters(),
+        (lora_layers if args.use_lora else unet).parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -288,9 +283,13 @@ def train_fn(config):
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+    if args.use_lora:
+        lora_layers, optimizer, lr_scheduler = accelerator.prepare(lora_layers, optimizer, lr_scheduler)
+    else:
+        unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
     if args.use_ema:
         accelerator.register_for_checkpointing(ema_unet)
+        ema_unet.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -305,8 +304,6 @@ def train_fn(config):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
-
-    gc.collect()
 
     # Train!
     total_batch_size = (
@@ -410,7 +407,7 @@ def train_fn(config):
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = model.parameters()
+                    params_to_clip = (lora_layers if args.use_lora else unet).parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -579,6 +576,7 @@ if __name__ == "__main__":
     result = trainer.fit()
     print(result)
     print(result.checkpoint)
+    del ray_datasets
     gc.collect()
 
     if args.validation_prompt is not None:

@@ -352,7 +352,7 @@ def run_inference(
 ):
     # Final inference
     # Load previous pipeline
-    
+
     print("Starting inference on GPU...")
 
     if isinstance(checkpoint, str):

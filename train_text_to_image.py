@@ -28,9 +28,9 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils.dataclasses import DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
+from accelerate.utils.dataclasses import DeepSpeedPlugin
 from datasets import load_dataset
 from diffusers import (
     AutoencoderKL,
@@ -44,8 +44,9 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
-from ray.air import Checkpoint, ScalingConfig, session, RunConfig
+from ray.air import Checkpoint, RunConfig, ScalingConfig, session
 from ray.train.torch import TorchTrainer
+from ray.tune.syncer import SyncConfig
 from transformers import CLIPTextModel
 
 from sd_preprocessing import get_preprocessor
@@ -91,12 +92,7 @@ def train_fn(config):
     else:
         deepspeed_plugin = None
 
-
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    
-    logger.info(
-        f"use_deepspeed: {args.use_deepspeed}, use_ema: {args.use_ema}, use_lora: {args.use_lora}"
-    )
 
     kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=True
@@ -121,6 +117,9 @@ def train_fn(config):
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+    logger.info(
+        f"use_deepspeed: {args.use_deepspeed}, use_ema: {args.use_ema}, use_lora: {args.use_lora}"
+    )
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -308,7 +307,7 @@ def train_fn(config):
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
 
     gc.collect()
-        
+
     # Train!
     total_batch_size = (
         args.train_batch_size
@@ -531,11 +530,7 @@ def train_fn(config):
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(
-        runtime_env={
-            "working_dir": "."
-        }
-    )
+    ray.init(runtime_env={"working_dir": "."})
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -573,12 +568,14 @@ if __name__ == "__main__":
         ),
         datasets=ray_datasets,
         preprocessor=preprocessor,
-        run_config=RunConfig(local_dir="/mnt/cluster_storage"),
+        run_config=RunConfig(
+            local_dir="/mnt/cluster_storage", sync_config=SyncConfig(syncer=None)
+        ),
     )
     result = trainer.fit()
     print(result)
     print(result.checkpoint)
-    
+
     if args.validation_prompt is not None:
         print("Starting inference...")
         # This will be ran on a single GPU.

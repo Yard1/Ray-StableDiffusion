@@ -352,6 +352,11 @@ def run_inference(
 ):
     # Final inference
     # Load previous pipeline
+    
+    print("Starting inference on GPU...")
+
+    if isinstance(checkpoint, str):
+        checkpoint = checkpoint.from_uri(checkpoint)
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -380,4 +385,5 @@ def run_inference(
                 args.validation_prompt, num_inference_steps=30, generator=generator
             ).images[0]
         )
+    print("Inference complete!")
     return images

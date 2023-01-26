@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
+import gc
 import logging
 import math
 import os
@@ -27,6 +28,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils.dataclasses import DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from datasets import load_dataset
@@ -42,7 +44,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
-from ray.air import Checkpoint, ScalingConfig, session
+from ray.air import Checkpoint, ScalingConfig, session, RunConfig
 from ray.train.torch import TorchTrainer
 from transformers import CLIPTextModel
 
@@ -66,6 +68,7 @@ ATTN_PROCS_DIR = "attn_procs"
 
 
 def train_fn(config):
+    gc.collect()
     args = config["args"]
 
     # Env vars necessary for HF to setup DDP
@@ -75,20 +78,25 @@ def train_fn(config):
     os.environ["OMP_NUM_THREADS"] = str(
         session.get_trial_resources().bundles[-1].get("CPU", 1)
     )
+    use_deepspeed = args.use_deepspeed
 
-    # DeepSpeed env vars
-    os.environ["ACCELERATE_USE_DEEPSPEED"] = "true" if args.use_deepspeed else "false"
-    os.environ["ACCELERATE_DEEPSPEED_ZERO_STAGE"] = "2"
-    os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(
-        args.gradient_accumulation_steps
-    )
-    os.environ["ACCELERATE_GRADIENT_CLIPPING"] = "1.0"
-    os.environ["ACCELERATE_DEEPSPEED_OFFLOAD_OPTIMIZER_DEVICE"] = "cpu"
-    os.environ["ACCELERATE_DEEPSPEED_OFFLOAD_PARAM_DEVICE"] = "cpu"
+    if use_deepspeed:
+        deepspeed_plugin = DeepSpeedPlugin(
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            gradient_clipping=1.0,
+            zero_stage=2,
+            offload_optimizer_device="cpu",
+            offload_param_device="cpu",
+        )
+    else:
+        deepspeed_plugin = None
 
-    use_deepspeed = os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true"
 
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    
+    logger.info(
+        f"use_deepspeed: {args.use_deepspeed}, use_ema: {args.use_ema}, use_lora: {args.use_lora}"
+    )
 
     kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=True
@@ -99,6 +107,7 @@ def train_fn(config):
         log_with=args.report_to,
         logging_dir=logging_dir,
         kwargs_handlers=[kwargs],
+        deepspeed_plugin=deepspeed_plugin,
     )
     if use_deepspeed:
         accelerator.state.deepspeed_plugin.deepspeed_config[
@@ -298,6 +307,8 @@ def train_fn(config):
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
 
+    gc.collect()
+        
     # Train!
     total_batch_size = (
         args.train_batch_size
@@ -481,6 +492,7 @@ def train_fn(config):
                             )
                 del pipeline
                 torch.cuda.empty_cache()
+                accelerator.wait_for_everyone()
 
             if logs:
                 session.report(metrics=logs, checkpoint=checkpoint)
@@ -519,7 +531,11 @@ def train_fn(config):
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(runtime_env={"working_dir": "."})
+    ray.init(
+        runtime_env={
+            "working_dir": "."
+        }
+    )
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -557,15 +573,18 @@ if __name__ == "__main__":
         ),
         datasets=ray_datasets,
         preprocessor=preprocessor,
+        run_config=RunConfig(local_dir="/mnt/cluster_storage"),
     )
     result = trainer.fit()
     print(result)
     print(result.checkpoint)
-
-    # This will be ran on a single GPU.
-    inference_task = run_inference.remote(
-        result.checkpoint, FINAL_PIPELINE_DIR, ATTN_PROCS_DIR, args
-    )
-    images = ray.get(inference_task)
-    for i, image in enumerate(images):
-        image.save(f"image_{i}.png")
+    
+    if args.validation_prompt is not None:
+        print("Starting inference...")
+        # This will be ran on a single GPU.
+        inference_task = run_inference.remote(
+            result.checkpoint.uri, FINAL_PIPELINE_DIR, ATTN_PROCS_DIR, args
+        )
+        images = ray.get(inference_task)
+        for i, image in enumerate(images):
+            image.save(f"image_{i}.png")

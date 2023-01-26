@@ -318,6 +318,8 @@ def train_fn(config):
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {train_dataset_len}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Epochs between validations = {args.validation_epochs}")
+    logger.info(f"  Steps between checkpoints = {args.checkpointing_steps}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
@@ -449,52 +451,53 @@ def train_fn(config):
             if global_step >= args.max_train_steps:
                 break
 
-            if (
-                args.validation_prompt is not None
-                and epoch % args.validation_epochs == 0
-            ):
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                # create pipeline
-                unet = accelerator.unwrap_model(unet)
-                pipeline = StableDiffusionPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    text_encoder=text_encoder,
-                    vae=vae,
-                    unet=unet,
-                    revision=args.revision,
-                )
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-                # run inference
-                generator = torch.Generator(device=accelerator.device).manual_seed(
-                    args.seed
-                )
-                images = []
-                for i in range(args.num_validation_images):
-                    images.append(
-                        pipeline(
-                            args.validation_prompt,
-                            num_inference_steps=30,
-                            generator=generator,
-                        ).images[0]
-                    )
-                    images[-1].save(f"image_{i}.png")
-                if accelerator.is_main_process:
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "tensorboard":
-                            np_images = np.stack([np.asarray(img) for img in images])
-                            tracker.writer.add_images(
-                                "validation", np_images, epoch, dataformats="NHWC"
-                            )
-                del pipeline
-                torch.cuda.empty_cache()
-                accelerator.wait_for_everyone()
-
             if logs:
                 session.report(metrics=logs, checkpoint=checkpoint)
+
+        if (
+            args.validation_prompt is not None
+            and epoch % args.validation_epochs == 0
+            and accelerator.is_main_process
+        ):
+            logger.info(
+                f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+                f" {args.validation_prompt}."
+            )
+            # create pipeline
+            unet = accelerator.unwrap_model(unet)
+            pipeline = StableDiffusionPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                text_encoder=text_encoder,
+                vae=vae,
+                unet=unet,
+                revision=args.revision,
+                torch_dtype=weight_dtype,
+            )
+            pipeline = pipeline.to(accelerator.device)
+            pipeline.set_progress_bar_config(disable=True)
+            # run inference
+            generator = torch.Generator(device=accelerator.device).manual_seed(
+                args.seed
+            )
+            images = []
+            for i in range(args.num_validation_images):
+                images.append(
+                    pipeline(
+                        args.validation_prompt,
+                        num_inference_steps=30,
+                        generator=generator,
+                    ).images[0]
+                )
+                images[-1].save(f"image_{i}.png")
+            for tracker in accelerator.trackers:
+                if tracker.name == "tensorboard":
+                    np_images = np.stack([np.asarray(img) for img in images])
+                    tracker.writer.add_images(
+                        "validation", np_images, epoch, dataformats="NHWC"
+                    )
+            del pipeline
+            torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -515,7 +518,8 @@ def train_fn(config):
             unet.save_attn_procs(
                 os.path.join(save_path, FINAL_PIPELINE_DIR, ATTN_PROCS_DIR)
             )
-        pipeline.save_pretrained(os.path.join(save_path, FINAL_PIPELINE_DIR))
+        else:
+            pipeline.save_pretrained(os.path.join(save_path, FINAL_PIPELINE_DIR))
         if not checkpoint:
             checkpoint = Checkpoint.from_directory(save_path)
     elif not checkpoint:

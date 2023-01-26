@@ -118,7 +118,7 @@ def parse_args():
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
+        "--seed", type=int, default=0, help="A seed for reproducible training."
     )
     parser.add_argument(
         "--resolution",
@@ -356,7 +356,7 @@ def run_inference(
     print("Starting inference on GPU...")
 
     if isinstance(checkpoint, str):
-        checkpoint = checkpoint.from_uri(checkpoint)
+        checkpoint = Checkpoint.from_uri(checkpoint)
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -366,7 +366,9 @@ def run_inference(
 
     with checkpoint.as_directory() as checkpoint_dir:
         pipeline = StableDiffusionPipeline.from_pretrained(
-            os.path.join(checkpoint_dir, final_pipeline_dir),
+            os.path.join(checkpoint_dir, final_pipeline_dir)
+            if not args.use_lora
+            else args.pretrained_model_name_or_path,
             revision=args.revision,
             torch_dtype=weight_dtype,
         )

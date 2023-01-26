@@ -19,6 +19,7 @@ import os
 
 import datasets
 import diffusers
+import numpy as np
 import ray
 import ray.data
 import torch
@@ -35,6 +36,8 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.cross_attention import LoRACrossAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -44,7 +47,7 @@ from ray.train.torch import TorchTrainer
 from transformers import CLIPTextModel
 
 from sd_preprocessing import get_preprocessor
-from sd_utils import parse_args
+from sd_utils import parse_args, run_inference
 
 try:
     from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -59,6 +62,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 GLOBAL_STEP_FILE = "global_step.txt"
 FINAL_PIPELINE_DIR = "final_pipeline"
+ATTN_PROCS_DIR = "attn_procs"
 
 
 def train_fn(config):
@@ -156,6 +160,22 @@ def train_fn(config):
         )
         ema_unet = EMAModel(ema_unet.parameters())
 
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move text_encode and vae to gpu and cast to weight_dtype
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    if args.use_ema:
+        ema_unet.to(accelerator.device)
+    else:
+        unet.to(accelerator.device, dtype=weight_dtype)
+
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
@@ -163,6 +183,43 @@ def train_fn(config):
             raise ValueError(
                 "xformers is not available. Make sure it is installed correctly"
             )
+
+    if args.use_lora:
+        # now we will add new LoRA weights to the attention layers
+        # It's important to realize here how many attention weights will be added and of which sizes
+        # The sizes of the attention layers consist only of two different variables:
+        # 1) - the "hidden_size", which is increased according to `unet.config.block_out_channels`.
+        # 2) - the "cross attention size", which is set to `unet.config.cross_attention_dim`.
+        # Let's first see how many attention processors we will have to set.
+        # For Stable Diffusion, it should be equal to:
+        # - down blocks (2x attention layers) * (2x transformer layers) * (3x down blocks) = 12
+        # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
+        # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
+        # => 32 layers
+        # Set correct lora layers
+        lora_attn_procs = {}
+        for name in unet.attn_processors.keys():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else unet.config.cross_attention_dim
+            )
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
+            lora_attn_procs[name] = LoRACrossAttnProcessor(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            )
+        unet.set_attn_processor(lora_attn_procs)
+        lora_layers = AttnProcsLayers(unet.attn_processors)
+        model = lora_layers
+    else:
+        model = unet
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -196,7 +253,7 @@ def train_fn(config):
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -223,23 +280,9 @@ def train_fn(config):
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
+    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
     if args.use_ema:
         accelerator.register_for_checkpointing(ema_unet)
-
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move text_encode and vae to gpu and cast to weight_dtype
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    if args.use_ema:
-        ema_unet.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -309,7 +352,7 @@ def train_fn(config):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(
-                    batch["pixel_values"].to(weight_dtype)
+                    batch["pixel_values"].to(dtype=weight_dtype)
                 ).latent_dist.sample()
                 latents = latents * 0.18215
 
@@ -355,7 +398,8 @@ def train_fn(config):
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    params_to_clip = model.parameters()
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -388,12 +432,55 @@ def train_fn(config):
                     "step": step,
                     "global_step": global_step,
                     "epoch": epoch,
-                    "train_loss": train_loss
+                    "train_loss": train_loss,
                 }
                 train_loss = 0.0
 
             if global_step >= args.max_train_steps:
                 break
+
+            if (
+                args.validation_prompt is not None
+                and epoch % args.validation_epochs == 0
+            ):
+                logger.info(
+                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+                    f" {args.validation_prompt}."
+                )
+                # create pipeline
+                unet = accelerator.unwrap_model(unet)
+                pipeline = StableDiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    text_encoder=text_encoder,
+                    vae=vae,
+                    unet=unet,
+                    revision=args.revision,
+                )
+                pipeline = pipeline.to(accelerator.device)
+                pipeline.set_progress_bar_config(disable=True)
+                # run inference
+                generator = torch.Generator(device=accelerator.device).manual_seed(
+                    args.seed
+                )
+                images = []
+                for i in range(args.num_validation_images):
+                    images.append(
+                        pipeline(
+                            args.validation_prompt,
+                            num_inference_steps=30,
+                            generator=generator,
+                        ).images[0]
+                    )
+                    images[-1].save(f"image_{i}.png")
+                if accelerator.is_main_process:
+                    for tracker in accelerator.trackers:
+                        if tracker.name == "tensorboard":
+                            np_images = np.stack([np.asarray(img) for img in images])
+                            tracker.writer.add_images(
+                                "validation", np_images, epoch, dataformats="NHWC"
+                            )
+                del pipeline
+                torch.cuda.empty_cache()
 
             if logs:
                 session.report(metrics=logs, checkpoint=checkpoint)
@@ -401,6 +488,7 @@ def train_fn(config):
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        unet = unet.to(torch.float32)
         unet = accelerator.unwrap_model(unet)
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
@@ -412,6 +500,10 @@ def train_fn(config):
             unet=unet,
             revision=args.revision,
         )
+        if args.use_lora:
+            unet.save_attn_procs(
+                os.path.join(save_path, FINAL_PIPELINE_DIR, ATTN_PROCS_DIR)
+            )
         pipeline.save_pretrained(os.path.join(save_path, FINAL_PIPELINE_DIR))
         if not checkpoint:
             checkpoint = Checkpoint.from_directory(save_path)
@@ -469,8 +561,11 @@ if __name__ == "__main__":
     result = trainer.fit()
     print(result)
     print(result.checkpoint)
-    with result.checkpoint.as_directory() as checkpoint_dir:
-        final_pipeline = StableDiffusionPipeline.from_pretrained(
-            os.path.join(checkpoint_dir, FINAL_PIPELINE_DIR),
-        )
-    print(final_pipeline)
+
+    # This will be ran on a single GPU.
+    inference_task = run_inference.remote(
+        result.checkpoint, FINAL_PIPELINE_DIR, ATTN_PROCS_DIR, args
+    )
+    images = ray.get(inference_task)
+    for i, image in enumerate(images):
+        image.save(f"image_{i}.png")

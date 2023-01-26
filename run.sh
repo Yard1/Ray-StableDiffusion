@@ -12,7 +12,7 @@ python train_text_to_image.py \
   --gradient_accumulation_steps=4 \
   --gradient_checkpointing \
   --mixed_precision="fp16" \
-  --max_train_steps=15000 \
+  --max_train_steps=1 \
   --checkpointing_steps=500 \
   --learning_rate=1e-05 \
   --max_grad_norm=1 \

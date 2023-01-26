@@ -579,6 +579,7 @@ if __name__ == "__main__":
     result = trainer.fit()
     print(result)
     print(result.checkpoint)
+    gc.collect()
 
     if args.validation_prompt is not None:
         print("Starting inference...")

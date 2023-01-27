@@ -1,5 +1,8 @@
 git+https://github.com/huggingface/diffusers.git
-# ray[air]  # has to be >=2.3!
+ray[air] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp310-cp310-manylinux2014_x86_64.whl; python_version == "3.10"
+ray[air] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp310-cp310-manylinux2014_x86_64.whl; python_version == "3.9"
+ray[air] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp38-cp38-manylinux2014_x86_64.whl; python_version == "3.8"
+ray[air] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp37-cp37m-manylinux2014_x86_64.whl; python_version == "3.7"
 accelerate
 torchvision
 transformers>=4.25.1

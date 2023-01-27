@@ -1,5 +1,5 @@
 git+https://github.com/huggingface/diffusers.git
-ray[air]  # has to be >=2.3!
+# ray[air]  # has to be >=2.3!
 accelerate
 torchvision
 transformers>=4.25.1
@@ -9,3 +9,4 @@ tensorboard
 Jinja2
 numexpr>=2.7.3
 deepspeed
+numpy<1.24

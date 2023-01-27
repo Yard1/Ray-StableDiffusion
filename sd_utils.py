@@ -1,7 +1,12 @@
 import argparse
+import os
 from typing import Optional
 
+import ray
+import torch
+from diffusers import StableDiffusionPipeline
 from huggingface_hub import HfFolder, whoami
+from ray.air import Checkpoint
 
 
 def get_full_repo_name(
@@ -71,6 +76,27 @@ def parse_args():
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
+        "--validation_prompt",
+        type=str,
+        default=None,
+        help="A prompt that is sampled during training for inference.",
+    )
+    parser.add_argument(
+        "--num_validation_images",
+        type=int,
+        default=4,
+        help="Number of images that should be generated during validation with `validation_prompt`.",
+    )
+    parser.add_argument(
+        "--validation_epochs",
+        type=int,
+        default=1,
+        help=(
+            "Run fine-tuning validation every X epochs. The validation process consists of running the prompt"
+            " `args.validation_prompt` multiple times: `args.num_validation_images`."
+        ),
+    )
+    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
@@ -92,7 +118,7 @@ def parse_args():
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
+        "--seed", type=int, default=0, help="A seed for reproducible training."
     )
     parser.add_argument(
         "--resolution",
@@ -298,6 +324,11 @@ def parse_args():
         action="store_true",
         help="Whether or not to use DeepSpeed.",
     )
+    parser.add_argument(
+        "--use-lora",
+        action="store_true",
+        help="Whether or not to use LoRA.",
+    )
 
     args = parser.parse_args()
 
@@ -309,4 +340,52 @@ def parse_args():
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
 
+    if args.use_ema and args.use_lora:
+        raise ValueError("Cannot use both EMA and LoRA.")
+
     return args
+
+
+@ray.remote(num_gpus=1)
+def run_inference(
+    checkpoint: Checkpoint, final_pipeline_dir: str, attn_procs_dir: str, args
+):
+    # Final inference
+    # Load previous pipeline
+
+    print("Starting inference on GPU...")
+
+    if isinstance(checkpoint, str):
+        checkpoint = Checkpoint.from_uri(checkpoint)
+
+    weight_dtype = torch.float32
+    if args.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif args.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    with checkpoint.as_directory() as checkpoint_dir:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            os.path.join(checkpoint_dir, final_pipeline_dir)
+            if not args.use_lora
+            else args.pretrained_model_name_or_path,
+            revision=args.revision,
+            torch_dtype=weight_dtype,
+        )
+        pipeline = pipeline.to("cuda")
+        # load attention processors
+        if args.use_lora:
+            pipeline.unet.load_attn_procs(
+                os.path.join(checkpoint_dir, final_pipeline_dir, attn_procs_dir)
+            )
+    # run inference
+    generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    images = []
+    for _ in range(args.num_validation_images):
+        images.append(
+            pipeline(
+                args.validation_prompt, num_inference_steps=30, generator=generator
+            ).images[0]
+        )
+    print("Inference complete!")
+    return images

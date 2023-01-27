@@ -2,15 +2,12 @@ import random
 from functools import partial
 from typing import Any, Dict
 
-import datasets
 import numpy as np
 import pandas as pd
 import ray
 import ray.data
 from ray.data.preprocessor import Preprocessor
 from ray.data.preprocessors import BatchMapper, Chain, TorchVisionPreprocessor
-from torchvision import transforms
-from transformers import CLIPTokenizer
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -46,6 +43,10 @@ def get_image_and_caption_columns(args, dataset_name_mapping, column_names):
 
 class Tokenizer:
     def __init__(self, pretrained_model_name_or_path, revision, caption_column) -> None:
+        # Importing here to work around a memory leak with Ray Data in 2.2
+        # Should be fixed in 2.3 or 2.4
+        from transformers import CLIPTokenizer
+
         self.tokenizer = CLIPTokenizer.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="tokenizer",
@@ -108,7 +109,11 @@ class TokenizerPreprocessor(Preprocessor):
 
 
 def ensure_correct_format(batch: pd.DataFrame, image_column) -> pd.DataFrame:
-    # Converts image to RGB and removes unnecessary column
+    """Converts image to RGB and removes unnecessary column"""
+    # Importing here to work around a memory leak with Ray Data in 2.2
+    # Should be fixed in 2.3 or 2.4
+    import datasets
+
     image_deature = datasets.Image()
     batch["pixel_values"] = [
         image_deature.decode_example(image).convert("RGB")
@@ -126,29 +131,35 @@ def get_preprocessor(args, dataset: ray.data.Dataset) -> Preprocessor:
         args, DATASET_NAME_MAPPING, column_names
     )
 
-    torchvision_transform = transforms.Compose(
-        [
-            transforms.Resize(
-                args.resolution,
-                interpolation=transforms.InterpolationMode.BILINEAR,
-            ),
-            transforms.CenterCrop(args.resolution)
-            if args.center_crop
-            else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip()
-            if args.random_flip
-            else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    def transform(*a, **k):
+        # Importing here to work around a memory leak with Ray Data in 2.2
+        # Should be fixed in 2.3 or 2.4
+        from torchvision import transforms
+
+        torchvision_transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    args.resolution,
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                ),
+                transforms.CenterCrop(args.resolution)
+                if args.center_crop
+                else transforms.RandomCrop(args.resolution),
+                transforms.RandomHorizontalFlip()
+                if args.random_flip
+                else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        return torchvision_transform(*a, **k)
 
     tokenizer = TokenizerPreprocessor(
         args.pretrained_model_name_or_path, args.revision, caption_column
     )
     image_preprocessor = TorchVisionPreprocessor(
         ["pixel_values"],
-        torchvision_transform,
+        transform,
     )
     ensure_correct_format_preprocessor = BatchMapper(
         partial(ensure_correct_format, image_column=image_column),

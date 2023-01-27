@@ -43,6 +43,8 @@ def get_image_and_caption_columns(args, dataset_name_mapping, column_names):
 
 class Tokenizer:
     def __init__(self, pretrained_model_name_or_path, revision, caption_column) -> None:
+        # Importing here to work around a memory leak with Ray Data in 2.2
+        # Should be fixed in 2.3 or 2.4
         from transformers import CLIPTokenizer
 
         self.tokenizer = CLIPTokenizer.from_pretrained(
@@ -107,7 +109,9 @@ class TokenizerPreprocessor(Preprocessor):
 
 
 def ensure_correct_format(batch: pd.DataFrame, image_column) -> pd.DataFrame:
-    # Converts image to RGB and removes unnecessary column
+    """Converts image to RGB and removes unnecessary column"""
+    # Importing here to work around a memory leak with Ray Data in 2.2
+    # Should be fixed in 2.3 or 2.4
     import datasets
 
     image_deature = datasets.Image()
@@ -128,6 +132,8 @@ def get_preprocessor(args, dataset: ray.data.Dataset) -> Preprocessor:
     )
 
     def transform(*a, **k):
+        # Importing here to work around a memory leak with Ray Data in 2.2
+        # Should be fixed in 2.3 or 2.4
         from torchvision import transforms
 
         torchvision_transform = transforms.Compose(

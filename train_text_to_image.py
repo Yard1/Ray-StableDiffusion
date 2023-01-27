@@ -17,6 +17,7 @@ import gc
 import logging
 import math
 import os
+from copy import deepcopy
 
 import datasets
 import diffusers
@@ -27,7 +28,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from accelerate.utils.dataclasses import DeepSpeedPlugin
@@ -94,15 +95,11 @@ def train_fn(config):
 
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
-    kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=True
-    )  # not sure if this is needed
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         logging_dir=logging_dir,
-        kwargs_handlers=[kwargs],
         deepspeed_plugin=deepspeed_plugin,
     )
     if use_deepspeed:
@@ -283,10 +280,17 @@ def train_fn(config):
     )
 
     # Prepare everything with our `accelerator`.
+    # We need to pass everything at once for DeepSpeed to work.
     if args.use_lora:
-        lora_layers, optimizer, lr_scheduler = accelerator.prepare(lora_layers, optimizer, lr_scheduler)
+        lora_layers, optimizer, lr_scheduler = accelerator.prepare(
+            lora_layers, optimizer, lr_scheduler
+        )
     else:
-        unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)
+        # Have an unwrapped copy of the model for validation later.
+        validation_unet = deepcopy(unet)
+        unet, optimizer, lr_scheduler = accelerator.prepare(
+            unet, optimizer, lr_scheduler
+        )
     if args.use_ema:
         accelerator.register_for_checkpointing(ema_unet)
         ema_unet.to(accelerator.device)
@@ -407,7 +411,9 @@ def train_fn(config):
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (lora_layers if args.use_lora else unet).parameters()
+                    params_to_clip = (
+                        lora_layers if args.use_lora else unet
+                    ).parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -453,6 +459,7 @@ def train_fn(config):
 
         if (
             args.validation_prompt is not None
+            and epoch > 0
             and epoch % args.validation_epochs == 0
             and accelerator.is_main_process
         ):
@@ -460,13 +467,19 @@ def train_fn(config):
                 f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
                 f" {args.validation_prompt}."
             )
-            # create pipeline
-            unet = accelerator.unwrap_model(unet)
+            # Do not unwrap unet itself as that breaks training later.
+            # Instead, we use a copy.
+            # This is not necessary for LoRA.
+            if not args.use_lora:
+                validation_unet.load_state_dict(unet.module.state_dict())
+                validation_unet = validation_unet.to(weight_dtype)
+            else:
+                validation_unet = accelerator.unwrap_model(unet)
             pipeline = StableDiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 text_encoder=text_encoder,
                 vae=vae,
-                unet=unet,
+                unet=validation_unet,
                 revision=args.revision,
                 torch_dtype=weight_dtype,
             )

@@ -429,18 +429,14 @@ def train_fn(config):
 
                 checkpoint = None
                 if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(
-                            args.output_dir, f"checkpoint-{global_step}"
-                        )
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        with open(os.path.join(save_path, GLOBAL_STEP_FILE), "w") as f:
-                            f.write(str(global_step))
-                        checkpoint = Checkpoint.from_directory(save_path)
-                    else:
-                        # Dummy checkpoint for non-0 rank workers
-                        checkpoint = Checkpoint.from_dict({"dummy": True})
+                    save_path = os.path.join(
+                        args.output_dir, f"checkpoint-{global_step}"
+                    )
+                    accelerator.save_state(save_path)
+                    logger.info(f"Saved state to {save_path}")
+                    with open(os.path.join(save_path, GLOBAL_STEP_FILE), "w") as f:
+                        f.write(str(global_step))
+                    checkpoint = Checkpoint.from_directory(save_path)
 
                 logs = {
                     "lr": lr_scheduler.get_last_lr()[0],

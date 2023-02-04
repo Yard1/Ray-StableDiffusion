@@ -494,7 +494,7 @@ def train_fn(config):
                     ).images[0]
                 )
                 images[-1].save(f"image_{i}.png")
-            for tracker in accelerator.trackers:
+            for tracker in getattr(accelerator, "trackers", []):
                 if tracker.name == "tensorboard":
                     np_images = np.stack([np.asarray(img) for img in images])
                     tracker.writer.add_images(

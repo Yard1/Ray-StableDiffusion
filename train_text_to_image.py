@@ -457,7 +457,6 @@ def train_fn(config):
             args.validation_prompt is not None
             and epoch > 0
             and epoch % args.validation_epochs == 0
-            and accelerator.is_main_process
         ):
             logger.info(
                 f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
